@@ -4,7 +4,7 @@ class PyneconeframeConfig(pc.Config):
     pass
 
 config = PyneconeframeConfig(
-    app_name="translator",
+    app_name="chatbot",
     db_url="sqlite:///pynecone.db",
     env=pc.Env.DEV,
 )
