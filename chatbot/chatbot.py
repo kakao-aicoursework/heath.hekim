@@ -28,78 +28,122 @@ from langchain.schema import (
     SystemMessage
 )
 
+from langchain.document_loaders import (
+    TextLoader,
+)
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+
+CHROMA_PERSIST_DIR = "chroma-persist"
+CHROMA_COLLECTION_NAME = "chroma_database"
+
 ###########################################################
 # Instances
-llm = OpenAI(temperature=0)
+llm = ChatOpenAI(temperature=0.1, max_tokens=2000)
+
+db = Chroma(
+    persist_directory=CHROMA_PERSIST_DIR,
+    embedding_function=OpenAIEmbeddings(),
+    collection_name=CHROMA_COLLECTION_NAME,
+)
+retriever = db.as_retriever()
+
+def prepare_embedding_db(file_path):
+    documents = TextLoader(file_path, encoding='UTF-8').load()
+
+    text_splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    docs = text_splitter.split_documents(documents)
+    print(docs, end='\n\n\n')
+
+    Chroma.from_documents(
+        docs,
+        OpenAIEmbeddings(),
+        collection_name=CHROMA_COLLECTION_NAME,
+        persist_directory=CHROMA_PERSIST_DIR,
+    )
+
+
+from langchain.chains import ConversationChain, LLMChain
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts.chat import ChatPromptTemplate
+
+intent_chain = LLMChain(llm=llm,  prompt=ChatPromptTemplate.from_template(template="""
+Your job is to determine the user message is related to the following list:
+- 카카오싱크
+- 카카오 싱크
+- KakaoSync
+- Kakao Sync
+
+Considering the user message, then return answer "YES" if it's related to the list, "NO" if it's not.
+
+
+User: {user_message}
+Answer:
+"""),  output_key="proceed", verbose=True,)
+
+search_chain = LLMChain(llm=llm, prompt=ChatPromptTemplate.from_template(template="""
+Your job is to read the following related document and answer the user's question based on the document.
+                                                                          
+<related_documents>
+{related_documents}
+</related_documents>
+
+
+User's question: {user_message}
+Answer:
+"""),  output_key="answer", verbose=True,)
+
+default_chain = ConversationChain(llm=llm, output_key="answer")
 
 def get_kakao_sync_doc():
 
     with open("project_data_kakao_sync.txt", "r", encoding='UTF-8') as f:
         return f.read()
 
-tools =[
-        Tool(
-            name="doc",
-            func=get_kakao_sync_doc,
-            description="카카오 싱크에 대한 설명을 가져옵니다.",
-        ),
-]
+prepare_embedding_db("project_data_kakao_sync.txt")
 
-#agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+from pprint import pprint
 
-#chat = ChatOpenAI(temperature=0.8)
-#system_message = "user의 질문을 다음 문서를 참고하여 대답하세요:\n{}".format(get_kakao_sync_doc())
-#system_message_prompt = SystemMessage(content=system_message)
-#human_template = ("question: {query}")
-#human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
-#chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
-#chain = LLMChain(llm=chat, prompt=chat_prompt)
-import tiktoken
+def ask_prompt(prompt):
+    context = dict(user_message=prompt)
+    context["input"] = context["user_message"]
 
-enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    proceed = intent_chain.run(context)
 
-def truncate_text(text, max_tokens=3000):
-    tokens = enc.encode(text)
-    if len(tokens) <= max_tokens:  # 토큰 수가 이미 3000 이하라면 전체 텍스트 반환
-        return text
-    return enc.decode(tokens[:max_tokens])
+    if proceed  == "YES":
+        context["related_documents"] = query_db(context["user_message"], use_retriever=True)
 
-llm = OpenAI(temperature=0.9)
-from langchain.prompts import PromptTemplate
+        answer = search_chain(context)
+    else:
+        answer = {"answer": default_chain.run(context["user_message"])}
 
-prompt = PromptTemplate(
-    input_variables=["query", "context"],
-    template="""
-    user의 주어진 질문을 다음 문서를 참고하여 대답하세요:
-    질문: {query}
-    문서: {context}
-    """
-)
+    return answer
 
-chain = LLMChain(llm=llm, prompt=prompt)
+def query_db(query: str, use_retriever: bool = False) -> list[str]:
+    if use_retriever:
+        docs = retriever.get_relevant_documents(query)
+    else:
+        docs = db.similarity_search(query)
+
+    str_docs = [doc.page_content for doc in docs]
+
+    return str_docs
 
 
 class State(pc.State):
     """The app state."""
 
     prompt: str
-    chat_history :list[str] = []
+    chat_history : str
 
     def do_ask(self):
-        self.chat_history.append(self.prompt)
+        self.chat_history = self.chat_history + "\n" + self.prompt
         #self.chat_history.append(agent.run(self.prompt))
-        short_context = truncate_text(get_kakao_sync_doc(), max_tokens=3500) 
-        print("prompt={}, context={}".format(self.prompt, short_context))
-        answer = chain.run(query=self.prompt, context=short_context)
-        self.chat_history.append(answer)
-
-    def set_prompt(self, prompt):
-        self.prompt = prompt
-
-    @pc.var
-    def get_history(self):
-        return '\n'.join(self.chat_history)
-
+        result = ask_prompt(self.prompt)
+        print(result["answer"])
+        self.chat_history = self.chat_history + "\n" + result["answer"]
+        self.prompt = ""
 
 def index():
     return pc.center(
@@ -112,11 +156,12 @@ def index():
                         height="30em",
                         width="100%",
                         is_read_only=True,
-                        text = State.get_history,
+                        value = State.chat_history
                     ),
                     pc.input(
                         placeholder="Question",
-                        on_blur=State.set_prompt,
+                        on_change=State.set_prompt,
+                        value=State.prompt,
                     ),
                     pc.button("Ask", on_click=State.do_ask),
                     shadow="lg",
